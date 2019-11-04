@@ -1,2 +1,5 @@
 [workspace]
 members = ["ruskcov", "inject", "inject-types"]
+
+[profile.release]
+lto = true

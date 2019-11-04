@@ -10,7 +10,10 @@
 // Always compile for injection into another process via LD_PRELOAD
 #![crate_type = "cdylib"]
 
-use inject_types::{ObjectInfo, PHdr, SetBreakpointsReq, SetBreakpointsResp};
+use inject_types::{
+    BreakpointInst, ObjectInfo, PHdr, SetBreakpointsReq, SetBreakpointsResp, BREAKPOINT, SOCKET_ENV,
+};
+use itertools::Itertools;
 use libc::{
     c_char, c_int, c_void, dl_iterate_phdr, dl_phdr_info, dlsym, size_t, PT_LOAD, RTLD_NEXT,
 };
@@ -58,6 +61,7 @@ fn gather_phdrs() -> Vec<ObjectInfo> {
             .collect();
 
         let pho = ObjectInfo {
+            pid: std::process::id(),
             path,
             addr: addr as usize,
             phdrs: phvec,
@@ -74,9 +78,73 @@ fn gather_phdrs() -> Vec<ObjectInfo> {
 
 /// Bulk set breakpoints given a vector of addresses to set them at
 fn set_breakpoints(mut breakpoints: Vec<usize>) -> SetBreakpointsResp {
+    const PAGE_SIZE: usize = 4096;
+
+    struct Span {
+        start: usize,      // base in bytes
+        len: usize,        // len in bytes
+        addrs: Vec<usize>, // raw addrs
+    }
+
+    impl Span {
+        fn new(addr: usize) -> Self {
+            Span {
+                start: addr & !(PAGE_SIZE - 1),
+                len: PAGE_SIZE,
+                addrs: vec![addr],
+            }
+        }
+
+        fn extend(self, other: Span) -> Result<Span, (Span, Span)> {
+            if (self.start..(self.start + self.len + PAGE_SIZE)).contains(&other.start) {
+                let mut addrs = self.addrs;
+                addrs.extend(other.addrs);
+                Ok(Span {
+                    start: self.start,
+                    len: other.start + other.len - self.start,
+                    addrs,
+                })
+            } else {
+                Err((self, other))
+            }
+        }
+    }
+
     breakpoints.sort();
 
-    unimplemented!()
+    let spans = breakpoints
+        .into_iter()
+        .map(Span::new)
+        .coalesce(|prev, cur| prev.extend(cur));
+    let mut res = Vec::new();
+
+    for span in spans {
+        unsafe {
+            libc::mprotect(
+                span.start as *mut c_void,
+                span.len as size_t,
+                libc::PROT_WRITE,
+            )
+        };
+
+        for addr in span.addrs {
+            let inst: &mut BreakpointInst = unsafe { mem::transmute(addr) };
+
+            let old = mem::replace(inst, BREAKPOINT);
+
+            res.push((addr, old));
+        }
+
+        unsafe {
+            libc::mprotect(
+                span.start as *mut c_void,
+                span.len as size_t,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+    }
+
+    SetBreakpointsResp { set: res }
 }
 
 /// Talk to controller. Expected protocol is:
@@ -87,7 +155,7 @@ fn set_breakpoints(mut breakpoints: Vec<usize>) -> SetBreakpointsResp {
 /// TODO: Better name
 fn send_phdrs() {
     // Address of a unix domain socket
-    let sock_path = match env::var("RUSKCOV_INJECT_SOCK") {
+    let sock_path = match env::var(SOCKET_ENV) {
         Ok(path) => path,
         Err(_) => return,
     };
