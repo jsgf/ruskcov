@@ -1,0 +1,2 @@
+[workspace]
+members = ["ruskcov", "inject", "inject-types"]
