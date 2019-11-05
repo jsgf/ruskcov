@@ -16,10 +16,7 @@ pub struct ObjectInfo {
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PHdr {
     pub vaddr: usize,
-    pub paddr: usize,
     pub memsize: usize,
-    pub filesize: u64,
-    pub offset: u64,
 }
 
 // Representation of a breakpoint for the architecture (1 byte for int3 on x86_64)

@@ -10,13 +10,12 @@
 // Always compile for injection into another process via LD_PRELOAD
 #![crate_type = "cdylib"]
 
+use findshlibs::{Segment, SharedLibrary, TargetSharedLibrary};
 use inject_types::{
     BreakpointInst, ObjectInfo, PHdr, SetBreakpointsReq, SetBreakpointsResp, BREAKPOINT, SOCKET_ENV,
 };
 use itertools::Itertools;
-use libc::{
-    c_char, c_int, c_void, dl_iterate_phdr, dl_phdr_info, dlsym, size_t, PT_LOAD, RTLD_NEXT,
-};
+use libc::{c_char, c_int, c_void, dlsym, size_t, RTLD_NEXT};
 use std::{
     env,
     ffi::{CStr, OsStr},
@@ -34,44 +33,27 @@ extern "C" {
 fn gather_phdrs() -> Vec<ObjectInfo> {
     let mut data: Vec<ObjectInfo> = Vec::new();
 
-    unsafe extern "C" fn callback(
-        info: *mut dl_phdr_info,
-        _size: size_t,
-        data: *mut c_void,
-    ) -> c_int {
-        let data: &mut Vec<ObjectInfo> = mem::transmute(data);
-        let info: &dl_phdr_info = mem::transmute(info);
-
-        let cpath = CStr::from_ptr(info.dlpi_name);
-        let path = PathBuf::from(OsStr::from_bytes(cpath.to_bytes()));
-        let addr = info.dlpi_addr;
-
-        let phdrs = slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize);
-
-        let phvec: Vec<PHdr> = phdrs
-            .iter()
-            .filter(|ph| ph.p_type == PT_LOAD)
-            .map(|ph| PHdr {
-                vaddr: ph.p_vaddr as usize,
-                paddr: ph.p_paddr as usize,
-                memsize: ph.p_memsz as usize,
-                filesize: ph.p_filesz as u64,
-                offset: ph.p_offset as u64,
+    TargetSharedLibrary::each(|shlib| {
+        let path = PathBuf::from(shlib.name());
+        let addr = shlib.virtual_memory_bias().0 as usize;
+        let phvec: Vec<PHdr> = shlib
+            .segments()
+            .filter(|seg| seg.is_code())
+            .map(|seg| PHdr {
+                vaddr: seg.stated_virtual_memory_address().0 as usize,
+                memsize: seg.len(),
             })
             .collect();
 
-        let pho = ObjectInfo {
+        let obj = ObjectInfo {
             pid: std::process::id(),
             path,
             addr: addr as usize,
             phdrs: phvec,
         };
 
-        data.push(pho);
-
-        0
-    }
-    unsafe { dl_iterate_phdr(Some(callback), mem::transmute::<_, *mut c_void>(&mut data)) };
+        data.push(obj);
+    });
 
     data
 }
