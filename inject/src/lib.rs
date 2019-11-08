@@ -26,6 +26,10 @@ use std::{
     ptr, slice,
 };
 
+mod span;
+
+use span::Span;
+
 extern "C" {
     fn breakpoint();
 }
@@ -60,37 +64,6 @@ fn gather_phdrs() -> Vec<ObjectInfo> {
 
 /// Bulk set breakpoints given a vector of addresses to set them at
 fn set_breakpoints(mut breakpoints: Vec<usize>) -> SetBreakpointsResp {
-    const PAGE_SIZE: usize = 4096;
-
-    struct Span {
-        start: usize,      // base in bytes
-        len: usize,        // len in bytes
-        addrs: Vec<usize>, // raw addrs
-    }
-
-    impl Span {
-        fn new(addr: usize) -> Self {
-            Span {
-                start: addr & !(PAGE_SIZE - 1),
-                len: PAGE_SIZE,
-                addrs: vec![addr],
-            }
-        }
-
-        fn extend(self, other: Span) -> Result<Span, (Span, Span)> {
-            if (self.start..(self.start + self.len + PAGE_SIZE)).contains(&other.start) {
-                let mut addrs = self.addrs;
-                addrs.extend(other.addrs);
-                Ok(Span {
-                    start: self.start,
-                    len: other.start + other.len - self.start,
-                    addrs,
-                })
-            } else {
-                Err((self, other))
-            }
-        }
-    }
 
     breakpoints.sort();
 

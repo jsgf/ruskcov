@@ -3,12 +3,17 @@ use inject_types::{ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV
 use object::read::Object;
 use std::{
     fs::File,
-    io::{BufReader, BufWriter, Write},
-    os::unix::net::UnixListener,
+    io::{self, BufReader, BufWriter, Write},
+    os::unix::{net::UnixListener, process::CommandExt},
     path::PathBuf,
     process::Command,
 };
 use structopt::StructOpt;
+
+#[cfg(target_os = "macos")]
+const INJECT_LIBRARY_VAR: &str = "DYLD_INSERT_LIBRARIES"; // XXX may not be enough to interpose dlopen
+#[cfg(all(unix, not(target_os = "macos")))]
+const INJECT_LIBRARY_VAR: &str = "LD_PRELOAD";
 
 #[derive(StructOpt)]
 struct Args {
@@ -42,16 +47,23 @@ fn try_main() -> Result<(), Error> {
 
     let listener = UnixListener::bind(&sock_path).context("Socket bind")?;
 
-    let child = Command::new(args.binary)
+    let mut command = Command::new(args.binary);
+    command
         .args(args.args)
-        .env("LD_PRELOAD", &args.inject)
-        .env(SOCKET_ENV, &sock_path)
-        .spawn()
-        .context("process spawn")?;
+        .env(INJECT_LIBRARY_VAR, &args.inject)
+        .env(SOCKET_ENV, &sock_path);
+    unsafe {
+        command.pre_exec(|| {
+            nix::sys::ptrace::traceme().map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+        })
+    };
+    let child = command.spawn().context("process spawn")?;
 
+    eprintln!("listening");
     for conn in listener.incoming() {
         match conn {
             Ok(conn) => {
+                eprintln!("connection");
                 let mut reader = BufReader::new(conn.try_clone().expect("clone failed"));
                 let mut writer = BufWriter::new(conn);
 

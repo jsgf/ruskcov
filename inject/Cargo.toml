@@ -15,5 +15,8 @@ bincode = "1.2"
 itertools = "0.8"
 findshlibs = "0.5"
 
+[dev-dependencies]
+proptest = "0.9"
+
 [build-dependencies]
 cc = "1.0"
