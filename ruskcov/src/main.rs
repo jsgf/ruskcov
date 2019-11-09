@@ -10,6 +10,8 @@ use std::{
 };
 use structopt::StructOpt;
 
+mod symtab;
+
 #[cfg(target_os = "macos")]
 const INJECT_LIBRARY_VAR: &str = "DYLD_INSERT_LIBRARIES"; // XXX may not be enough to interpose dlopen
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -27,10 +29,15 @@ struct Args {
 fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Error> {
     let file = File::open(&obj.path).context("Failed to open object")?;
     let map = unsafe { memmap::Mmap::map(&file).context("mmap failed")? };
-    let obj = &object::File::parse(&*map).expect("object file parse failed");
-    let symbols = obj.symbol_map();
+    let objfile = &object::File::parse(&*map).expect("object file parse failed");
 
-    println!("obj {:#?}", obj);
+    let ctxt = symtab::Context::new(objfile)?;
+
+    println!("units for {}: {:#?}", obj.path.display(), ctxt.units());
+
+    for unit in ctxt.units() {
+        if let Some(llnp) = &unit.line_program;
+    }
 
     Ok(std::iter::empty())
 }
@@ -52,14 +59,24 @@ fn try_main() -> Result<(), Error> {
         .args(args.args)
         .env(INJECT_LIBRARY_VAR, &args.inject)
         .env(SOCKET_ENV, &sock_path);
-    unsafe {
-        command.pre_exec(|| {
-            nix::sys::ptrace::traceme().map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-        })
-    };
+    if false {
+        // XXX calling this will trap on exec so parent needs to start handling us
+        unsafe {
+            command.pre_exec(|| {
+                println!("about to traceme");
+                let res = nix::sys::ptrace::traceme()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+                println!("traceme done {:?}", res);
+                if let Err(err) = &res {
+                    eprintln!("ptrace traceme failed: {}", err);
+                }
+                res
+            })
+        };
+    }
     let child = command.spawn().context("process spawn")?;
 
-    eprintln!("listening");
+    eprintln!("listening child pid {}", child.id());
     for conn in listener.incoming() {
         match conn {
             Ok(conn) => {
