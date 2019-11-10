@@ -3,3 +3,7 @@ members = ["ruskcov", "inject", "inject-types"]
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+object = { git = "https://github.com/gimli-rs/object" } # updated dependencies
+goblin = { git = "https://github.com/jsgf/goblin.git" } # fix broken pt_interp

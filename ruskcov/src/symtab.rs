@@ -24,9 +24,9 @@ pub struct Context<R = gimli::EndianRcSlice<gimli::RunTimeEndian>>
 where
     R: gimli::Reader,
 {
-    unit_ranges: Vec<(gimli::Range, usize)>,
+    pub unit_ranges: Vec<(gimli::Range, usize)>,
     units: Vec<ResUnit<R>>,
-    sections: gimli::Dwarf<R>,
+    pub sections: gimli::Dwarf<R>,
 }
 
 impl Context<gimli::EndianRcSlice<gimli::RunTimeEndian>> {
