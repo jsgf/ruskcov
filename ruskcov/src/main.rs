@@ -3,6 +3,7 @@ use gimli::read::Reader;
 use inject_types::{ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
 use object::read::Object;
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     fs::File,
     io::{self, BufReader, BufWriter, Write},
@@ -12,7 +13,10 @@ use std::{
 };
 use structopt::StructOpt;
 
+mod error;
 mod symtab;
+
+use error::ObjectError;
 
 #[cfg(target_os = "macos")]
 const INJECT_LIBRARY_VAR: &str = "DYLD_INSERT_LIBRARIES"; // XXX may not be enough to interpose dlopen
@@ -24,28 +28,39 @@ struct Args {
     /// Path to libruskcov_inject.so (TODO: build in)
     #[structopt(long, default_value = "libruskcov_inject.so")]
     inject: PathBuf,
+    /// Print verbose debug gunk
+    #[structopt(long)]
+    debug: bool,
     binary: PathBuf,
     args: Vec<String>,
 }
 
-fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Error> {
+fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item = usize>, Error> {
+    if debug {
+        println!("Object {:x?}", obj);
+    }
     let map = {
         let file = File::open(&obj.path).context("Failed to open object")?;
         unsafe { memmap::Mmap::map(&file).context("mmap failed")? }
     };
-    let objfile = object::File::parse(&*map).expect("object file parse failed");
+    let objfile = object::File::parse(&*map)
+        .map_err(ObjectError)
+        .context("object file parse failed")?;
 
+    // pre-declare to get the right lifetime
     let linkmap;
     let linkobjfile;
 
     let objfile = if let Some((name, crc)) = objfile.gnu_debuglink() {
         let name = Path::new(OsStr::from_bytes(name));
-        println!(
-            "{} => debuglink {} {:x}",
-            obj.path.display(),
-            name.display(),
-            crc
-        );
+        if debug {
+            println!(
+                "{} => debuglink {} {:x}",
+                obj.path.display(),
+                name.display(),
+                crc
+            );
+        }
 
         let objdir = obj.path.parent().unwrap_or(Path::new("."));
         let relobjdir = objdir
@@ -59,16 +74,17 @@ fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Erro
         let paths = vec![
             objdir.join(name),
             objdir.join(".debug").join(name),
-            Path::new("/usr/lib/debug").join(relobjdir).join(name),
+            Path::new("/usr/lib/debug").join(&relobjdir).join(name),
             // TODO: option for other debug dirs
         ];
 
         let mut file = None;
 
         for path in paths {
-            println!("Candidate: {}", path.display());
             if let Ok(f) = File::open(&path) {
-                println!("Using debuglink {}", path.display());
+                if debug {
+                    println!("Using debuglink {}", path.display());
+                }
                 file = Some(f);
                 break;
             }
@@ -77,11 +93,12 @@ fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Erro
         if let Some(file) = file {
             linkmap = unsafe { memmap::Mmap::map(&file).context("mmap failed")? };
             let linked_crc = crc::crc32::checksum_ieee(&*linkmap);
-            println!("want crc {:x} got {:x}", crc, linked_crc);
             if crc == linked_crc {
                 match object::File::parse(&*linkmap) {
                     Ok(obj) => {
                         linkobjfile = obj;
+                        drop(objfile);
+                        drop(map);
                         &linkobjfile
                     }
                     Err(err) => {
@@ -106,17 +123,19 @@ fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Erro
 
     //println!("units for {}: {:#?}", obj.path.display(), ctxt.units());
     for unit in ctxt.units() {
-        println!(
-            "==== NEW UNIT ==== {} {}",
-            unit.comp_dir
-                .as_ref()
-                .map(|dir| dir.to_string_lossy().unwrap().into_owned())
-                .unwrap_or("<no dir>".to_string()),
-            unit.name
-                .as_ref()
-                .map(|name| name.to_string_lossy().unwrap().into_owned())
-                .unwrap_or("<no name>".to_string()),
-        );
+        if debug {
+            println!(
+                "==== NEW UNIT ==== {} {}",
+                unit.comp_dir
+                    .as_ref()
+                    .map(|dir| dir.to_string_lossy().unwrap().into_owned())
+                    .unwrap_or("<no dir>".to_string()),
+                unit.name
+                    .as_ref()
+                    .map(|name| name.to_string_lossy().unwrap().into_owned())
+                    .unwrap_or("<no name>".to_string()),
+            );
+        }
         if let Some(ilnp) = &unit.line_program {
             let mut rows = ilnp.clone().rows();
             while let Some((header, row)) = rows.next_row()? {
@@ -124,16 +143,19 @@ fn get_breakpoints(obj: &ObjectInfo) -> Result<impl Iterator<Item = usize>, Erro
                     continue;
                 }
                 let file = row.file(header).unwrap();
-                println!(
-                    "row: addr: {}, dir: {}, file {:?}",
-                    row.address(),
-                    ctxt.sections
-                        .attr_string(unit, file.directory(header).unwrap())?
-                        .to_string_lossy()?,
-                    ctxt.sections
-                        .attr_string(unit, file.path_name())?
-                        .to_string_lossy()?
-                );
+                if debug {
+                    println!(
+                        "row: addr: {:x}, (mapped {:x}), dir: {}, file {:?}",
+                        row.address(),
+                        row.address() + obj.addr as u64,
+                        ctxt.sections
+                            .attr_string(unit, file.directory(header).unwrap())?
+                            .to_string_lossy()?,
+                        ctxt.sections
+                            .attr_string(unit, file.path_name())?
+                            .to_string_lossy()?
+                    );
+                }
             }
         }
     }
@@ -175,6 +197,8 @@ fn try_main() -> Result<(), Error> {
     }
     let child = command.spawn().context("process spawn")?;
 
+    let mut objseen = HashSet::new();
+
     eprintln!("listening child pid {}", child.id());
     for conn in listener.incoming() {
         match conn {
@@ -186,7 +210,9 @@ fn try_main() -> Result<(), Error> {
                 let objinfo: Vec<ObjectInfo> =
                     bincode::deserialize_from(&mut reader).expect("ObjectInfo decode failed");
                 for obj in &objinfo {
-                    let _ = get_breakpoints(obj);
+                    if objseen.insert(obj.path.clone()) {
+                        let _ = get_breakpoints(obj, args.debug);
+                    }
                 }
 
                 bincode::serialize_into(&mut writer, &SetBreakpointsReq::default())
