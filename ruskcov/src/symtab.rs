@@ -1,11 +1,12 @@
 //! Ripped from https://github.com/gimli-rs/addr2line/blob/master/src/lib.rs
 
 mod alloc {
-    pub use std::{borrow, rc, string, vec};
+    pub use std::{borrow, rc, string, vec, sync};
 }
 
 use alloc::borrow::Cow;
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -17,6 +18,8 @@ use fallible_iterator::FallibleIterator;
 use intervaltree::{Element, IntervalTree};
 use lazycell::LazyCell;
 use smallvec::SmallVec;
+
+use crate::mapped_slice::MappedSlice;
 
 type Error = gimli::Error;
 
@@ -30,7 +33,8 @@ where
 }
 
 impl Context<gimli::EndianRcSlice<gimli::RunTimeEndian>> {
-    pub fn new<'data, 'file, O: object::Object<'data, 'file>>(
+        /// Copy debug sections from the object file and manage them with Rc.
+    pub fn new_rc<'data, 'file, O: object::Object<'data, 'file>>(
         file: &'file O,
     ) -> Result<Self, Error> {
         let endian = if file.is_little_endian() {
@@ -77,6 +81,104 @@ impl Context<gimli::EndianRcSlice<gimli::RunTimeEndian>> {
     }
 }
 
+impl Context<gimli::EndianArcSlice<gimli::RunTimeEndian>> {
+    /// Copy debug sections from the object file and manage them with Arc.
+    pub fn new_arc<'data, 'file, O: object::Object<'data, 'file>>(
+        file: &'file O,
+    ) -> Result<Self, Error> {
+        let endian = if file.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+
+        fn load_section<'data, 'file, O, S, Endian>(file: &'file O, endian: Endian) -> S
+        where
+            O: object::Object<'data, 'file>,
+            S: gimli::Section<gimli::EndianArcSlice<Endian>>,
+            Endian: gimli::Endianity,
+        {
+            let data = file
+                .section_data_by_name(S::section_name())
+                .unwrap_or(Cow::Borrowed(&[]));
+            S::from(gimli::EndianArcSlice::new(Arc::from(&*data), endian))
+        }
+
+        let debug_abbrev: gimli::DebugAbbrev<_> = load_section(file, endian);
+        let debug_addr: gimli::DebugAddr<_> = load_section(file, endian);
+        let debug_info: gimli::DebugInfo<_> = load_section(file, endian);
+        let debug_line: gimli::DebugLine<_> = load_section(file, endian);
+        let debug_line_str: gimli::DebugLineStr<_> = load_section(file, endian);
+        let debug_ranges: gimli::DebugRanges<_> = load_section(file, endian);
+        let debug_rnglists: gimli::DebugRngLists<_> = load_section(file, endian);
+        let debug_str: gimli::DebugStr<_> = load_section(file, endian);
+        let debug_str_offsets: gimli::DebugStrOffsets<_> = load_section(file, endian);
+        let default_section = gimli::EndianArcSlice::new(Arc::from(&[][..]), endian);
+
+        Context::from_sections(
+            debug_abbrev,
+            debug_addr,
+            debug_info,
+            debug_line,
+            debug_line_str,
+            debug_ranges,
+            debug_rnglists,
+            debug_str,
+            debug_str_offsets,
+            default_section,
+        )
+    }
+}
+
+impl Context<gimli::EndianReader<gimli::RunTimeEndian, MappedSlice>> {
+    /// Construct a context from a mapping. This is zero-copy - all the sections are used out of the mapping.
+    pub fn new_from_mapping<'data, 'file, O: object::Object<'data, 'file>>(
+        mapping: &'data MappedSlice,
+        file: &'file O,
+    ) -> Result<Self, Error> {
+        let endian = if file.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+
+        fn map_section<'data, 'file, O, S, Endian>(mapping: &MappedSlice, file: &'file O, endian: Endian) -> S
+        where
+            O: object::Object<'data, 'file>,
+            S: gimli::Section<gimli::EndianReader<Endian, MappedSlice>>,
+            Endian: gimli::Endianity,
+        {
+            let data = file
+                .section_data_by_name(S::section_name())
+                .unwrap_or(Cow::Borrowed(&[]));
+            S::from(gimli::EndianReader::new(mapping.subslice_from_slice(&*data), endian))
+        }
+
+        let debug_abbrev: gimli::DebugAbbrev<_> = map_section(mapping, file, endian);
+        let debug_addr: gimli::DebugAddr<_> = map_section(mapping, file, endian);
+        let debug_info: gimli::DebugInfo<_> = map_section(mapping, file, endian);
+        let debug_line: gimli::DebugLine<_> = map_section(mapping, file, endian);
+        let debug_line_str: gimli::DebugLineStr<_> = map_section(mapping, file, endian);
+        let debug_ranges: gimli::DebugRanges<_> = map_section(mapping, file, endian);
+        let debug_rnglists: gimli::DebugRngLists<_> = map_section(mapping, file, endian);
+        let debug_str: gimli::DebugStr<_> = map_section(mapping, file, endian);
+        let debug_str_offsets: gimli::DebugStrOffsets<_> = map_section(mapping, file, endian);
+        let default_section = gimli::EndianReader::new(mapping.subslice(0..0), endian);
+
+        Context::from_sections(
+            debug_abbrev,
+            debug_addr,
+            debug_info,
+            debug_line,
+            debug_line_str,
+            debug_ranges,
+            debug_rnglists,
+            debug_str,
+            debug_str_offsets,
+            default_section,
+        )
+    }
+}
 
 impl<R: gimli::Reader> Context<R> {
     /// Construct a new `Context` from DWARF sections.

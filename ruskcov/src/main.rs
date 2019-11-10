@@ -7,16 +7,20 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{self, BufReader, BufWriter, Write},
+    ops::{Deref, Index, Range},
     os::unix::{ffi::OsStrExt, net::UnixListener, process::CommandExt},
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 use structopt::StructOpt;
 
 mod error;
+mod mapped_slice;
 mod symtab;
 
 use error::ObjectError;
+use mapped_slice::MappedSlice;
 
 #[cfg(target_os = "macos")]
 const INJECT_LIBRARY_VAR: &str = "DYLD_INSERT_LIBRARIES"; // XXX may not be enough to interpose dlopen
@@ -41,17 +45,17 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
     }
     let map = {
         let file = File::open(&obj.path).context("Failed to open object")?;
-        unsafe { memmap::Mmap::map(&file).context("mmap failed")? }
+
+        MappedSlice::new(file)?
     };
     let objfile = object::File::parse(&*map)
         .map_err(ObjectError)
         .context("object file parse failed")?;
 
-    // pre-declare to get the right lifetime
+    let linkobj;
     let linkmap;
-    let linkobjfile;
 
-    let objfile = if let Some((name, crc)) = objfile.gnu_debuglink() {
+    let (objfile, mapping) = if let Some((name, crc)) = objfile.gnu_debuglink() {
         let name = Path::new(OsStr::from_bytes(name));
         if debug {
             println!(
@@ -91,35 +95,36 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
         }
 
         if let Some(file) = file {
-            linkmap = unsafe { memmap::Mmap::map(&file).context("mmap failed")? };
+            linkmap = MappedSlice::new(file)?;
             let linked_crc = crc::crc32::checksum_ieee(&*linkmap);
             if crc == linked_crc {
                 match object::File::parse(&*linkmap) {
                     Ok(obj) => {
-                        linkobjfile = obj;
+                        linkobj = obj;
+
                         drop(objfile);
                         drop(map);
-                        &linkobjfile
+                        (&linkobj, &linkmap)
                     }
                     Err(err) => {
                         println!("Failed to parse debuglink {:?}", err);
-                        &objfile
+                        (&objfile, &map)
                     }
                 }
             } else {
                 // CRC mismatch
-                &objfile
+                (&objfile, &map)
             }
         } else {
             // Couldn't find debuglink, use the object
-            &objfile
+            (&objfile, &map)
         }
     } else {
         // No debuglink, just use the object
-        &objfile
+        (&objfile, &map)
     };
 
-    let ctxt = symtab::Context::new(objfile)?;
+    let ctxt = symtab::Context::new_from_mapping(mapping, objfile)?;
 
     //println!("units for {}: {:#?}", obj.path.display(), ctxt.units());
     for unit in ctxt.units() {
@@ -145,7 +150,7 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
                 let file = row.file(header).unwrap();
                 if debug {
                     println!(
-                        "row: addr: {:x}, (mapped {:x}), dir: {}, file {:?}",
+                        "row: addr: {:x}, (mapped {:x}), dir: {}, file {:?}:{}",
                         row.address(),
                         row.address() + obj.addr as u64,
                         ctxt.sections
@@ -153,7 +158,8 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
                             .to_string_lossy()?,
                         ctxt.sections
                             .attr_string(unit, file.path_name())?
-                            .to_string_lossy()?
+                            .to_string_lossy()?,
+                        row.line().unwrap_or(0),
                     );
                 }
             }
