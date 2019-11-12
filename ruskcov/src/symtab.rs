@@ -1,13 +1,13 @@
 //! Ripped from https://github.com/gimli-rs/addr2line/blob/master/src/lib.rs
 
 mod alloc {
-    pub use std::{borrow, rc, string, vec, sync};
+    pub use std::{borrow, rc, string, sync, vec};
 }
 
 use alloc::borrow::Cow;
 use alloc::rc::Rc;
-use alloc::sync::Arc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use std::cmp::Ordering;
@@ -33,7 +33,7 @@ where
 }
 
 impl Context<gimli::EndianRcSlice<gimli::RunTimeEndian>> {
-        /// Copy debug sections from the object file and manage them with Rc.
+    /// Copy debug sections from the object file and manage them with Rc.
     pub fn new_rc<'data, 'file, O: object::Object<'data, 'file>>(
         file: &'file O,
     ) -> Result<Self, Error> {
@@ -136,22 +136,34 @@ impl Context<gimli::EndianReader<gimli::RunTimeEndian, MappedSlice>> {
         mapping: &'data MappedSlice,
         file: &'file O,
     ) -> Result<Self, Error> {
+        use object::read::ObjectSection;
+
         let endian = if file.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {
             gimli::RunTimeEndian::Big
         };
 
-        fn map_section<'data, 'file, O, S, Endian>(mapping: &MappedSlice, file: &'file O, endian: Endian) -> S
+        fn map_section<'data, 'file, O, S, Endian>(
+            mapping: &MappedSlice,
+            file: &'file O,
+            endian: Endian,
+        ) -> S
         where
             O: object::Object<'data, 'file>,
             S: gimli::Section<gimli::EndianReader<Endian, MappedSlice>>,
             Endian: gimli::Endianity,
         {
-            let data = file
-                .section_data_by_name(S::section_name())
-                .unwrap_or(Cow::Borrowed(&[]));
-            S::from(gimli::EndianReader::new(mapping.subslice_from_slice(&*data), endian))
+            let mapping = if let Some((offset, size)) =
+                file.section_by_name(S::section_name()).and_then(|s| s.offset())
+            {
+                let offset = offset as usize;
+                let size = size as usize;
+                mapping.subslice(offset..offset + size)
+            } else {
+                mapping.subslice(0..0)
+            };
+            S::from(gimli::EndianReader::new(mapping, endian))
         }
 
         let debug_abbrev: gimli::DebugAbbrev<_> = map_section(mapping, file, endian);
@@ -764,7 +776,6 @@ impl<R: gimli::Reader> FunctionName<R> {
         self.name.to_string_lossy()
     }
 }
-
 
 /// A source location.
 pub struct Location<'a> {

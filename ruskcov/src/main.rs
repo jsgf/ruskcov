@@ -2,6 +2,7 @@ use anyhow::{Context, Error};
 use gimli::read::Reader;
 use inject_types::{ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
 use object::read::Object;
+use regex::RegexSet;
 use std::{
     collections::HashSet,
     ffi::OsStr,
@@ -27,11 +28,18 @@ const INJECT_LIBRARY_VAR: &str = "DYLD_INSERT_LIBRARIES"; // XXX may not be enou
 #[cfg(all(unix, not(target_os = "macos")))]
 const INJECT_LIBRARY_VAR: &str = "LD_PRELOAD";
 
-#[derive(StructOpt)]
+#[derive(StructOpt, Debug, Clone)]
+#[structopt(rename_all = "kebab-case")]
 struct Args {
     /// Path to libruskcov_inject.so (TODO: build in)
     #[structopt(long, default_value = "libruskcov_inject.so")]
     inject: PathBuf,
+    /// Include sources in directories matching this REGEX
+    #[structopt(long, number_of_values(1))]
+    include_dir: Vec<String>,
+    /// Include sources in directories matching this REGEX
+    #[structopt(long, number_of_values(1))]
+    exclude_dir: Vec<String>,
     /// Print verbose debug gunk
     #[structopt(long)]
     debug: bool,
@@ -39,12 +47,23 @@ struct Args {
     args: Vec<String>,
 }
 
-fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item = usize>, Error> {
-    if debug {
-        println!("Object {:x?}", obj);
-    }
+/// Filter for interesting source files. By default, all files are
+/// considered interesting, and then the include and exclude filters are applied. Include
+/// takes precidence over exclude.
+#[derive(Clone, Debug)]
+struct Filter {
+    /// Include all directories matching this set
+    dir_include: RegexSet,
+    /// Exclude all directories matching this set (include takes precidence)
+    dir_exclude: RegexSet,
+}
+
+fn load_debug(
+    path: &Path,
+    debug: bool,
+) -> Result<symtab::Context<gimli::EndianReader<gimli::RunTimeEndian, MappedSlice>>, Error> {
     let map = {
-        let file = File::open(&obj.path).context("Failed to open object")?;
+        let file = File::open(path).context("Failed to open object")?;
 
         MappedSlice::new(file)?
     };
@@ -60,13 +79,13 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
         if debug {
             println!(
                 "{} => debuglink {} {:x}",
-                obj.path.display(),
+                path.display(),
                 name.display(),
                 crc
             );
         }
 
-        let objdir = obj.path.parent().unwrap_or(Path::new("."));
+        let objdir = path.parent().unwrap_or(Path::new("."));
         let relobjdir = objdir
             .components()
             .filter(|c| match c {
@@ -124,38 +143,85 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
         (&objfile, &map)
     };
 
-    let ctxt = symtab::Context::new_from_mapping(mapping, objfile)?;
+    symtab::Context::new_from_mapping(mapping, objfile).map_err(Error::from)
+}
+
+fn get_breakpoints(
+    obj: &ObjectInfo,
+    filter: &Filter,
+    debug: bool,
+) -> Result<impl Iterator<Item = usize>, Error> {
+    if debug {
+        println!("Object {:x?}", obj);
+    }
+
+    let ctxt = load_debug(&obj.path, debug)?;
 
     //println!("units for {}: {:#?}", obj.path.display(), ctxt.units());
     for unit in ctxt.units() {
+        let comp_dir = unit
+            .comp_dir
+            .as_ref()
+            .map(|dir| dir.to_string_lossy().map(|dir| dir.into_owned()))
+            .transpose()?;
+        let comp_dir = Path::new(comp_dir.as_ref().map(String::as_str).unwrap_or("."));
+
         if debug {
             println!(
                 "==== NEW UNIT ==== {} {}",
-                unit.comp_dir
-                    .as_ref()
-                    .map(|dir| dir.to_string_lossy().unwrap().into_owned())
-                    .unwrap_or("<no dir>".to_string()),
+                comp_dir.display(),
                 unit.name
                     .as_ref()
                     .map(|name| name.to_string_lossy().unwrap().into_owned())
-                    .unwrap_or("<no name>".to_string()),
+                    .unwrap_or("???".to_string()),
             );
         }
+
         if let Some(ilnp) = &unit.line_program {
+            let header = ilnp.header();
+            // directory-level filter
+            let allowed_dirs: Vec<bool> = (0..)
+                .map(|idx| header.directory(idx))
+                .take_while(Option::is_some)
+                .map(Option::unwrap)
+                .map(|dir| -> Result<bool, Error> {
+                    let dir = ctxt
+                        .sections
+                        .attr_string(unit, dir)?
+                        .to_string_lossy()?
+                        .into_owned();
+                    let strdir = comp_dir.join(dir).display().to_string();
+
+                    let allow = filter.dir_include.is_match(&strdir)
+                        || !filter.dir_exclude.is_match(&strdir);
+
+                    if debug {
+                        println!("dir {} allow {:?}", strdir, allow);
+                    }
+                    Ok(allow)
+                })
+                .collect::<Result<_, _>>()?;
+            println!("allowed_dirs {:?}", allowed_dirs);
+
             let mut rows = ilnp.clone().rows();
             while let Some((header, row)) = rows.next_row()? {
                 if !row.is_stmt() {
                     continue;
                 }
                 let file = row.file(header).unwrap();
+                if !allowed_dirs[file.directory_index() as usize] {
+                    continue;
+                }
                 if debug {
                     println!(
-                        "row: addr: {:x}, (mapped {:x}), dir: {}, file {:?}:{}",
+                        "row: addr: {:x}, (mapped {:x}), dir: {} idx {} {:?}, file {}:{}",
                         row.address(),
                         row.address() + obj.addr as u64,
                         ctxt.sections
                             .attr_string(unit, file.directory(header).unwrap())?
                             .to_string_lossy()?,
+                        file.directory_index(),
+                        allowed_dirs[file.directory_index() as usize],
                         ctxt.sections
                             .attr_string(unit, file.path_name())?
                             .to_string_lossy()?,
@@ -172,10 +238,19 @@ fn get_breakpoints(obj: &ObjectInfo, debug: bool) -> Result<impl Iterator<Item =
 fn try_main() -> Result<(), Error> {
     let args = Args::from_args();
 
+    if args.debug {
+        println!("Args {:#?}", args);
+    }
+
     let tempdir = tempfile::Builder::new()
         .prefix("ruskcov")
         .tempdir()
         .context("Making tempdir")?;
+
+    let filter = Filter {
+        dir_include: RegexSet::new(&args.include_dir)?,
+        dir_exclude: RegexSet::new(&args.exclude_dir)?,
+    };
 
     let sock_path = tempdir.path().join("rustkcov.sock");
 
@@ -217,7 +292,7 @@ fn try_main() -> Result<(), Error> {
                     bincode::deserialize_from(&mut reader).expect("ObjectInfo decode failed");
                 for obj in &objinfo {
                     if objseen.insert(obj.path.clone()) {
-                        let _ = get_breakpoints(obj, args.debug);
+                        let _ = get_breakpoints(obj, &filter, args.debug);
                     }
                 }
 

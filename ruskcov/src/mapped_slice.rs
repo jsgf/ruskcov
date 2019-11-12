@@ -24,6 +24,7 @@ impl MappedSlice {
         })
     }
 
+    #[inline]
     pub fn bytes(&self) -> &[u8] {
         &**self
     }
@@ -80,6 +81,7 @@ impl MappedSlice {
 impl Deref for MappedSlice {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.mapping[self.start..self.end]
     }
