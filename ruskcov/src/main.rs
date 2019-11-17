@@ -1,13 +1,16 @@
 use anyhow::{Context, Error};
 use gimli::read::Reader;
 use inject_types::{ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
+use internment::Intern;
 use object::read::Object;
 use regex::RegexSet;
 use std::{
+    borrow::Borrow,
     collections::HashSet,
     ffi::OsStr,
     fs::File,
     io::{self, BufReader, BufWriter, Write},
+    iter,
     ops::{Deref, Index, Range},
     os::unix::{ffi::OsStrExt, net::UnixListener, process::CommandExt},
     path::{Component, Path, PathBuf},
@@ -56,6 +59,67 @@ struct Filter {
     dir_include: RegexSet,
     /// Exclude all directories matching this set (include takes precidence)
     dir_exclude: RegexSet,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct SrcDir(Intern<PathBuf>);
+
+impl<T> From<T> for SrcDir
+where
+    T: Into<PathBuf>,
+{
+    fn from(p: T) -> Self {
+        SrcDir(Intern::new(p.into()))
+    }
+}
+
+impl Deref for SrcDir {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_path()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct SrcFile(Intern<PathBuf>);
+
+impl<T> From<T> for SrcFile
+where
+    T: Into<PathBuf>,
+{
+    fn from(p: T) -> Self {
+        SrcFile(Intern::new(p.into()))
+    }
+}
+
+impl Deref for SrcFile {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_path()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct SrcPath(SrcDir, SrcFile);
+
+impl SrcPath {
+    fn new<D: Into<PathBuf>, F: Into<PathBuf>>(dir: D, file: F) -> Self {
+        SrcPath(From::from(dir), From::from(file))
+    }
+
+    fn to_pathbuf(&self) -> PathBuf {
+        self.0.join(&*self.1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct Location {
+    // Mapped address in process (ie, breakpoint address)
+    addr: u64,
+    // Filename referenced
+    srcpath: SrcPath,
+    // Line number
+    line: u32,
 }
 
 fn load_debug(
@@ -150,12 +214,14 @@ fn get_breakpoints(
     obj: &ObjectInfo,
     filter: &Filter,
     debug: bool,
-) -> Result<impl Iterator<Item = usize>, Error> {
+) -> Result<impl Iterator<Item = Location>, Error> {
     if debug {
         println!("Object {:x?}", obj);
     }
 
     let ctxt = load_debug(&obj.path, debug)?;
+
+    let mut locations = Vec::new();
 
     //println!("units for {}: {:#?}", obj.path.display(), ctxt.units());
     for unit in ctxt.units() {
@@ -179,12 +245,12 @@ fn get_breakpoints(
 
         if let Some(ilnp) = &unit.line_program {
             let header = ilnp.header();
-            // directory-level filter
-            let allowed_dirs: Vec<bool> = (0..)
+            // Directory-level filter, indexed by the per-unit directory index number.
+            let allowed_dirs: Vec<(String, bool)> = (0..)
                 .map(|idx| header.directory(idx))
                 .take_while(Option::is_some)
                 .map(Option::unwrap)
-                .map(|dir| -> Result<bool, Error> {
+                .map(|dir| -> Result<(String, bool), Error> {
                     let dir = ctxt
                         .sections
                         .attr_string(unit, dir)?
@@ -195,13 +261,13 @@ fn get_breakpoints(
                     let allow = filter.dir_include.is_match(&strdir)
                         || !filter.dir_exclude.is_match(&strdir);
 
-                    if debug {
-                        println!("dir {} allow {:?}", strdir, allow);
-                    }
-                    Ok(allow)
+                    Ok((strdir, allow))
                 })
                 .collect::<Result<_, _>>()?;
-            println!("allowed_dirs {:?}", allowed_dirs);
+
+            if debug {
+                println!("allowed_dirs {:?}", allowed_dirs);
+            }
 
             let mut rows = ilnp.clone().rows();
             while let Some((header, row)) = rows.next_row()? {
@@ -209,30 +275,34 @@ fn get_breakpoints(
                     continue;
                 }
                 let file = row.file(header).unwrap();
-                if !allowed_dirs[file.directory_index() as usize] {
+                if !allowed_dirs[file.directory_index() as usize].1 {
                     continue;
                 }
+                let dirname = &allowed_dirs[file.directory_index() as usize].0;
+                let filename = ctxt.sections.attr_string(unit, file.path_name())?;
+                let line = row.line().unwrap_or(0);
+
+                let loc = Location {
+                    srcpath: SrcPath::new(dirname, &*filename.to_string_lossy()?),
+                    line: line as u32,
+                    addr: row.address() + obj.addr as u64,
+                };
+
                 if debug {
                     println!(
-                        "row: addr: {:x}, (mapped {:x}), dir: {} idx {} {:?}, file {}:{}",
-                        row.address(),
-                        row.address() + obj.addr as u64,
-                        ctxt.sections
-                            .attr_string(unit, file.directory(header).unwrap())?
-                            .to_string_lossy()?,
-                        file.directory_index(),
-                        allowed_dirs[file.directory_index() as usize],
-                        ctxt.sections
-                            .attr_string(unit, file.path_name())?
-                            .to_string_lossy()?,
-                        row.line().unwrap_or(0),
+                        "Location: {}:{} {:x}",
+                        loc.srcpath.to_pathbuf().display(),
+                        loc.line,
+                        loc.addr
                     );
                 }
+
+                locations.push(loc);
             }
         }
     }
 
-    Ok(std::iter::empty())
+    Ok(locations.into_iter())
 }
 
 fn try_main() -> Result<(), Error> {
