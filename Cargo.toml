@@ -6,3 +6,4 @@ lto = true
 
 [patch.crates-io]
 object = { git = "https://github.com/jsgf/object.git", branch = "segment-offset" } # updated dependencies; added offset
+nix = { git = "https://github.com/jsgf/nix-rust.git", branch = "ptrace-seize" }

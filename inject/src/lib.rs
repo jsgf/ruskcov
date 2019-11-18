@@ -15,7 +15,7 @@ use inject_types::{
     BreakpointInst, ObjectInfo, PHdr, SetBreakpointsReq, SetBreakpointsResp, BREAKPOINT, SOCKET_ENV,
 };
 use itertools::Itertools;
-use libc::{c_char, c_int, c_void, dlsym, size_t, RTLD_NEXT};
+use libc::{c_char, c_int, c_void, dlsym, raise, size_t, RTLD_NEXT, SIGSTOP};
 use std::{
     env,
     ffi::{CStr, OsStr},
@@ -64,7 +64,6 @@ fn gather_phdrs() -> Vec<ObjectInfo> {
 
 /// Bulk set breakpoints given a vector of addresses to set them at
 fn set_breakpoints(mut breakpoints: Vec<usize>) -> SetBreakpointsResp {
-
     breakpoints.sort();
 
     let spans = breakpoints
@@ -168,6 +167,8 @@ pub unsafe extern "C" fn dlopen(name: *mut c_char, flags: c_int) -> *mut c_void 
 
 #[ctor::ctor]
 fn init_send_phdrs() {
+    // Stop so tracer can catch up
+    unsafe { raise(SIGSTOP) };
     // Controller will be expecting phdrs immediately
     send_phdrs();
 }

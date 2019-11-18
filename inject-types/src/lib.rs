@@ -20,7 +20,7 @@ pub struct PHdr {
 }
 
 // Representation of a breakpoint for the architecture (1 byte for int3 on x86_64)
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct BreakpointInst(pub [u8; 1]);
 

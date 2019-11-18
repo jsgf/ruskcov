@@ -155,7 +155,7 @@ impl Context<gimli::EndianReader<gimli::RunTimeEndian, MappedSlice>> {
             Endian: gimli::Endianity,
         {
             let mapping = if let Some((offset, size)) =
-                file.section_by_name(S::section_name()).and_then(|s| s.offset())
+                file.section_by_name(S::section_name()).and_then(|s| s.file_range())
             {
                 let offset = offset as usize;
                 let size = size as usize;

@@ -1,7 +1,11 @@
 use anyhow::{Context, Error};
 use gimli::read::Reader;
-use inject_types::{ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
+use inject_types::{BreakpointInst, ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
 use internment::Intern;
+use nix::{
+    sys::{ptrace, signal, wait},
+    unistd::Pid,
+};
 use object::read::Object;
 use regex::RegexSet;
 use std::{
@@ -14,8 +18,9 @@ use std::{
     ops::{Deref, Index, Range},
     os::unix::{ffi::OsStrExt, net::UnixListener, process::CommandExt},
     path::{Component, Path, PathBuf},
-    process::Command,
-    sync::Arc,
+    process::{Child, Command},
+    sync::{Arc, Mutex},
+    thread,
 };
 use structopt::StructOpt;
 
@@ -59,6 +64,24 @@ struct Filter {
     dir_include: RegexSet,
     /// Exclude all directories matching this set (include takes precidence)
     dir_exclude: RegexSet,
+}
+
+struct State {
+    primary: Child,
+    tracees: HashSet<u32>,
+}
+
+impl State {
+    fn new(primary: Child) -> Self {
+        let mut tracees = HashSet::new();
+        let _ = tracees.insert(primary.id());
+
+        State { primary, tracees }
+    }
+
+    fn add_child(&mut self, child: &Child) {
+        let _ = self.tracees.insert(child.id());
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -120,6 +143,8 @@ struct Location {
     srcpath: SrcPath,
     // Line number
     line: u32,
+    // Replaced instruction when breakpoint set
+    replaced: Option<BreakpointInst>,
 }
 
 fn load_debug(
@@ -210,11 +235,7 @@ fn load_debug(
     symtab::Context::new_from_mapping(mapping, objfile).map_err(Error::from)
 }
 
-fn get_breakpoints(
-    obj: &ObjectInfo,
-    filter: &Filter,
-    debug: bool,
-) -> Result<impl Iterator<Item = Location>, Error> {
+fn get_breakpoints(obj: &ObjectInfo, filter: &Filter, debug: bool) -> Result<Vec<Location>, Error> {
     if debug {
         println!("Object {:x?}", obj);
     }
@@ -286,6 +307,7 @@ fn get_breakpoints(
                     srcpath: SrcPath::new(dirname, &*filename.to_string_lossy()?),
                     line: line as u32,
                     addr: row.address() + obj.addr as u64,
+                    replaced: None,
                 };
 
                 if debug {
@@ -302,7 +324,7 @@ fn get_breakpoints(
         }
     }
 
-    Ok(locations.into_iter())
+    Ok(locations)
 }
 
 fn try_main() -> Result<(), Error> {
@@ -331,26 +353,55 @@ fn try_main() -> Result<(), Error> {
         .args(args.args)
         .env(INJECT_LIBRARY_VAR, &args.inject)
         .env(SOCKET_ENV, &sock_path);
-    if false {
-        // XXX calling this will trap on exec so parent needs to start handling us
-        unsafe {
-            command.pre_exec(|| {
-                println!("about to traceme");
-                let res = nix::sys::ptrace::traceme()
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
-                println!("traceme done {:?}", res);
-                if let Err(err) = &res {
-                    eprintln!("ptrace traceme failed: {}", err);
-                }
-                res
-            })
-        };
-    }
+    unsafe {
+        command.pre_exec(|| {
+            println!("about to traceme");
+            let res = ptrace::traceme().map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+            match &res {
+                Ok(_) => {}
+                Err(err) => eprintln!("ptrace traceme failed: {}", err),
+            }
+            res
+        })
+    };
+
     let child = command.spawn().context("process spawn")?;
+    let child_id = Pid::from_raw(child.id() as i32);
+
+    let mut state = Arc::new(Mutex::new(State::new(child)));
+
+    ptrace::seize(
+        child_id,
+        ptrace::Options::PTRACE_O_TRACECLONE
+            | ptrace::Options::PTRACE_O_TRACEEXEC
+            | ptrace::Options::PTRACE_O_TRACEFORK
+            | ptrace::Options::PTRACE_O_TRACEVFORK
+            | ptrace::Options::PTRACE_O_TRACESYSGOOD,
+    )
+    .context("attaching to child")?;
+
+    thread::spawn({
+        let state = state.clone();
+        move || {
+            while let Ok(status) = wait::wait() {
+                use wait::WaitStatus::*;
+                println!("wait status {:?}", status);
+                match status {
+                    Exited(pid, status) => unimplemented!(),
+                    Signaled(pid, sig, coredumped) => unimplemented!(),
+                    Stopped(pid, signal) => unimplemented!(),
+                    PtraceEvent(pid, sig, event) => unimplemented!(),
+                    PtraceSyscall(pid) => unimplemented!(),
+                    Continued(pid) => unimplemented!(),
+                    StillAlive => {}
+                }
+            }
+        }
+    });
 
     let mut objseen = HashSet::new();
 
-    eprintln!("listening child pid {}", child.id());
+    eprintln!("listening child pid {}", child_id);
     for conn in listener.incoming() {
         match conn {
             Ok(conn) => {
@@ -361,8 +412,18 @@ fn try_main() -> Result<(), Error> {
                 let objinfo: Vec<ObjectInfo> =
                     bincode::deserialize_from(&mut reader).expect("ObjectInfo decode failed");
                 for obj in &objinfo {
-                    if objseen.insert(obj.path.clone()) {
-                        let _ = get_breakpoints(obj, &filter, args.debug);
+                    if objseen.insert((obj.pid, obj.path.clone())) {
+                        match get_breakpoints(obj, &filter, args.debug) {
+                            Ok(bp) => println!(
+                                "{}: would set {} breakpoints for obj {}",
+                                obj.pid,
+                                bp.len(),
+                                obj.path.display()
+                            ),
+                            Err(err) => {
+                                println!("Failed to get bps for {}: {}", obj.path.display(), err)
+                            }
+                        }
                     }
                 }
 
