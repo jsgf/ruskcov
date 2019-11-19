@@ -168,7 +168,8 @@ pub unsafe extern "C" fn dlopen(name: *mut c_char, flags: c_int) -> *mut c_void 
 #[ctor::ctor]
 fn init_send_phdrs() {
     // Stop so tracer can catch up
-    unsafe { raise(SIGSTOP) };
+    //unsafe { raise(SIGSTOP) };
+    unsafe { breakpoint() };
     // Controller will be expecting phdrs immediately
     send_phdrs();
 }

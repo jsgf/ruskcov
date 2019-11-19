@@ -5,5 +5,4 @@ members = ["ruskcov", "inject", "inject-types"]
 lto = true
 
 [patch.crates-io]
-object = { git = "https://github.com/jsgf/object.git", branch = "segment-offset" } # updated dependencies; added offset
-nix = { git = "https://github.com/jsgf/nix-rust.git", branch = "ptrace-seize" }
+nix = { git = "https://github.com/nix-rust/nix.git" }

@@ -7,10 +7,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-structopt = "0.3.3"
-gimli = "0.19.0"
-nix = "0.15.0"
-object = "0.15.0"
+structopt = "0.3"
+gimli = "0.19"
+nix = "0.15"
+object = "0.16"
 inject-types = { path = "../inject-types" }
 bincode = "1.2"
 tempfile = "3.1"

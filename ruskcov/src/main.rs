@@ -353,17 +353,6 @@ fn try_main() -> Result<(), Error> {
         .args(args.args)
         .env(INJECT_LIBRARY_VAR, &args.inject)
         .env(SOCKET_ENV, &sock_path);
-    unsafe {
-        command.pre_exec(|| {
-            println!("about to traceme");
-            let res = ptrace::traceme().map_err(|err| io::Error::new(io::ErrorKind::Other, err));
-            match &res {
-                Ok(_) => {}
-                Err(err) => eprintln!("ptrace traceme failed: {}", err),
-            }
-            res
-        })
-    };
 
     let child = command.spawn().context("process spawn")?;
     let child_id = Pid::from_raw(child.id() as i32);
@@ -373,7 +362,6 @@ fn try_main() -> Result<(), Error> {
     ptrace::seize(
         child_id,
         ptrace::Options::PTRACE_O_TRACECLONE
-            | ptrace::Options::PTRACE_O_TRACEEXEC
             | ptrace::Options::PTRACE_O_TRACEFORK
             | ptrace::Options::PTRACE_O_TRACEVFORK
             | ptrace::Options::PTRACE_O_TRACESYSGOOD,
@@ -387,12 +375,15 @@ fn try_main() -> Result<(), Error> {
                 use wait::WaitStatus::*;
                 println!("wait status {:?}", status);
                 match status {
-                    Exited(pid, status) => unimplemented!(),
-                    Signaled(pid, sig, coredumped) => unimplemented!(),
-                    Stopped(pid, signal) => unimplemented!(),
-                    PtraceEvent(pid, sig, event) => unimplemented!(),
-                    PtraceSyscall(pid) => unimplemented!(),
-                    Continued(pid) => unimplemented!(),
+                    Exited(pid, status) => unimplemented!("{:?}", status),
+                    Signaled(pid, sig, coredumped) => unimplemented!("{:?}", status),
+                    Stopped(pid, signal) => unimplemented!("{:?}", status),
+                    PtraceEvent(pid, sig, event) => {
+                        let ev: ptrace::Event = unsafe { std::mem::transmute(event) };
+                        unimplemented!("{:?} ev {:?}", status, ev)
+                    }
+                    PtraceSyscall(pid) => unimplemented!("{:?}", status),
+                    Continued(pid) => unimplemented!("{:?}", status),
                     StillAlive => {}
                 }
             }
