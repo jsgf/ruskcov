@@ -39,20 +39,20 @@ fn gather_phdrs() -> Vec<ObjectInfo> {
 
     TargetSharedLibrary::each(|shlib| {
         let path = PathBuf::from(shlib.name());
-        let addr = shlib.virtual_memory_bias().0 as usize;
+        let addr = shlib.virtual_memory_bias().0 as u64;
         let phvec: Vec<PHdr> = shlib
             .segments()
             .filter(|seg| seg.is_code())
             .map(|seg| PHdr {
-                vaddr: seg.stated_virtual_memory_address().0 as usize,
-                memsize: seg.len(),
+                vaddr: seg.stated_virtual_memory_address().0 as u64,
+                memsize: seg.len() as u64,
             })
             .collect();
 
         let obj = ObjectInfo {
             pid: std::process::id(),
             path,
-            addr: addr as usize,
+            addr: addr,
             phdrs: phvec,
         };
 
@@ -86,7 +86,7 @@ fn set_breakpoints(mut breakpoints: Vec<usize>) -> SetBreakpointsResp {
 
             let old = mem::replace(inst, BREAKPOINT);
 
-            res.push((addr, old));
+            res.push((addr as u64, old));
         }
 
         unsafe {
@@ -139,7 +139,13 @@ fn send_phdrs() {
             break;
         }
 
-        let resp = set_breakpoints(breakpoints.breakpoints);
+        let resp = set_breakpoints(
+            breakpoints
+                .breakpoints
+                .into_iter()
+                .map(|bp| bp as usize)
+                .collect(),
+        );
 
         bincode::serialize_into(&mut sock_wr, &resp).expect("sending breakpoint responses failed");
         sock_wr.flush().expect("breakpoint resp flush failed");

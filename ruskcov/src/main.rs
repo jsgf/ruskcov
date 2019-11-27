@@ -3,7 +3,7 @@ use gimli::read::Reader;
 use inject_types::{BreakpointInst, ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
 use internment::Intern;
 use nix::{
-    sys::{ptrace, signal, wait},
+    sys::{signal, wait},
     unistd::Pid,
 };
 use object::read::Object;
@@ -28,6 +28,12 @@ mod error;
 mod mapped_slice;
 mod symtab;
 
+#[cfg_attr(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    path = "ptrace_x86.rs"
+)]
+mod ptrace;
+
 use error::ObjectError;
 use mapped_slice::MappedSlice;
 
@@ -40,8 +46,8 @@ const INJECT_LIBRARY_VAR: &str = "LD_PRELOAD";
 #[structopt(rename_all = "kebab-case")]
 struct Args {
     /// Path to libruskcov_inject.so (TODO: build in)
-    #[structopt(long, default_value = "libruskcov_inject.so")]
-    inject: PathBuf,
+    #[structopt(long, default_value = "libruskcov_inject.so", number_of_values(1))]
+    inject: Vec<PathBuf>,
     /// Include sources in directories matching this REGEX
     #[structopt(long, number_of_values(1))]
     include_dir: Vec<String>,
@@ -221,6 +227,9 @@ fn load_debug(
                 }
             } else {
                 // CRC mismatch
+                if debug {
+                    println!("debuglink {} crc mismatch got {:08x} wanted {:08x}", path.display(), linked_crc, crc);
+                }
                 (&objfile, &map)
             }
         } else {
@@ -351,7 +360,7 @@ fn try_main() -> Result<(), Error> {
     let mut command = Command::new(args.binary);
     command
         .args(args.args)
-        .env(INJECT_LIBRARY_VAR, &args.inject)
+        .env(INJECT_LIBRARY_VAR, std::env::join_paths(&args.inject)?)
         .env(SOCKET_ENV, &sock_path);
 
     let child = command.spawn().context("process spawn")?;
@@ -359,25 +368,38 @@ fn try_main() -> Result<(), Error> {
 
     let mut state = Arc::new(Mutex::new(State::new(child)));
 
-    ptrace::seize(
-        child_id,
-        ptrace::Options::PTRACE_O_TRACECLONE
-            | ptrace::Options::PTRACE_O_TRACEFORK
-            | ptrace::Options::PTRACE_O_TRACEVFORK
-            | ptrace::Options::PTRACE_O_TRACESYSGOOD,
-    )
-    .context("attaching to child")?;
-
     thread::spawn({
         let state = state.clone();
         move || {
+            ptrace::seize(
+                child_id,
+                ptrace::Options::PTRACE_O_TRACECLONE
+                    | ptrace::Options::PTRACE_O_TRACEFORK
+                    | ptrace::Options::PTRACE_O_TRACEVFORK, //| ptrace::Options::PTRACE_O_TRACESYSGOOD
+            )
+            .context("attaching to child")
+            .expect("seize failed");
             while let Ok(status) = wait::wait() {
                 use wait::WaitStatus::*;
                 println!("wait status {:?}", status);
                 match status {
-                    Exited(pid, status) => unimplemented!("{:?}", status),
+                    Exited(pid, status) => {
+                        println!("pid {} exited status {}", pid, status);
+                    }
                     Signaled(pid, sig, coredumped) => unimplemented!("{:?}", status),
-                    Stopped(pid, signal) => unimplemented!("{:?}", status),
+                    Stopped(pid, signal) => {
+                        let ip = match ptrace::getregs(pid).expect("getregs") {
+                            ptrace::UserRegs::I386(regs) => u64::from(regs.eip),
+                            ptrace::UserRegs::X86_64(regs) => u64::from(regs.rip),
+                        };
+
+                        println!("stopped pid {} signal {} rip {:x}", pid, signal, ip);
+                        if signal == signal::SIGTRAP {
+                            ptrace::cont(pid, None).expect("cont failed");
+                        } else {
+                            ptrace::cont(pid, Some(signal)).expect("cont signal failed");
+                        }
+                    }
                     PtraceEvent(pid, sig, event) => {
                         let ev: ptrace::Event = unsafe { std::mem::transmute(event) };
                         unimplemented!("{:?} ev {:?}", status, ev)

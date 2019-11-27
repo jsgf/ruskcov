@@ -8,15 +8,15 @@ pub const SOCKET_ENV: &str = "RUSKCOV_INJECT_SOCK";
 pub struct ObjectInfo {
     pub pid: u32,
     pub path: PathBuf,
-    pub addr: usize,
+    pub addr: u64,
     pub phdrs: Vec<PHdr>,
 }
 
 /// Mapping of a specific PHdr in a process address space
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PHdr {
-    pub vaddr: usize,
-    pub memsize: usize,
+    pub vaddr: u64,
+    pub memsize: u64,
 }
 
 // Representation of a breakpoint for the architecture (1 byte for int3 on x86_64)
@@ -32,11 +32,11 @@ pub const BREAKPOINT: BreakpointInst = BreakpointInst([0xcc]);
 /// in the injected .so.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SetBreakpointsReq {
-    pub breakpoints: Vec<usize>,
+    pub breakpoints: Vec<u64>,
 }
 
 /// Response to setting breakpoints - for each breakpoint set it returns the original value
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SetBreakpointsResp {
-    pub set: Vec<(usize, BreakpointInst)>,
+    pub set: Vec<(u64, BreakpointInst)>,
 }

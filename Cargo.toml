@@ -6,3 +6,4 @@ lto = true
 
 [patch.crates-io]
 nix = { git = "https://github.com/nix-rust/nix.git" }
+findshlibs = { path = "../findshlibs" }

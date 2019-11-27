@@ -13,7 +13,7 @@ libc = "0.2"
 inject-types = { path = "../inject-types" }
 bincode = "1.2"
 itertools = "0.8"
-findshlibs = "0.5"
+findshlibs = "0.6"
 
 [dev-dependencies]
 proptest = "0.9"
