@@ -1,7 +1,6 @@
 use anyhow::{Context, Error};
 use gimli::read::Reader;
 use inject_types::{BreakpointInst, ObjectInfo, SetBreakpointsReq, SetBreakpointsResp, SOCKET_ENV};
-use internment::Intern;
 use nix::{
     sys::{signal, wait},
     unistd::Pid,
@@ -26,7 +25,11 @@ use structopt::StructOpt;
 
 mod error;
 mod mapped_slice;
+mod process;
+mod srcloc;
 mod symtab;
+
+use srcloc::{Location, SrcPath};
 
 #[cfg_attr(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -88,69 +91,6 @@ impl State {
     fn add_child(&mut self, child: &Child) {
         let _ = self.tracees.insert(child.id());
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct SrcDir(Intern<PathBuf>);
-
-impl<T> From<T> for SrcDir
-where
-    T: Into<PathBuf>,
-{
-    fn from(p: T) -> Self {
-        SrcDir(Intern::new(p.into()))
-    }
-}
-
-impl Deref for SrcDir {
-    type Target = Path;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_path()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct SrcFile(Intern<PathBuf>);
-
-impl<T> From<T> for SrcFile
-where
-    T: Into<PathBuf>,
-{
-    fn from(p: T) -> Self {
-        SrcFile(Intern::new(p.into()))
-    }
-}
-
-impl Deref for SrcFile {
-    type Target = Path;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_path()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct SrcPath(SrcDir, SrcFile);
-
-impl SrcPath {
-    fn new<D: Into<PathBuf>, F: Into<PathBuf>>(dir: D, file: F) -> Self {
-        SrcPath(From::from(dir), From::from(file))
-    }
-
-    fn to_pathbuf(&self) -> PathBuf {
-        self.0.join(&*self.1)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct Location {
-    // Mapped address in process (ie, breakpoint address)
-    addr: u64,
-    // Filename referenced
-    srcpath: SrcPath,
-    // Line number
-    line: u32,
-    // Replaced instruction when breakpoint set
-    replaced: Option<BreakpointInst>,
 }
 
 fn load_debug(
@@ -228,7 +168,12 @@ fn load_debug(
             } else {
                 // CRC mismatch
                 if debug {
-                    println!("debuglink {} crc mismatch got {:08x} wanted {:08x}", path.display(), linked_crc, crc);
+                    println!(
+                        "debuglink {} crc mismatch got {:08x} wanted {:08x}",
+                        path.display(),
+                        linked_crc,
+                        crc
+                    );
                 }
                 (&objfile, &map)
             }
@@ -244,7 +189,11 @@ fn load_debug(
     symtab::Context::new_from_mapping(mapping, objfile).map_err(Error::from)
 }
 
-fn get_breakpoints(obj: &ObjectInfo, filter: &Filter, debug: bool) -> Result<Vec<Location>, Error> {
+fn get_breakpoints(
+    obj: &ObjectInfo,
+    filter: &Filter,
+    debug: bool,
+) -> Result<Vec<(u64, Location)>, Error> {
     if debug {
         println!("Object {:x?}", obj);
     }
@@ -312,23 +261,22 @@ fn get_breakpoints(obj: &ObjectInfo, filter: &Filter, debug: bool) -> Result<Vec
                 let filename = ctxt.sections.attr_string(unit, file.path_name())?;
                 let line = row.line().unwrap_or(0);
 
-                let loc = Location {
-                    srcpath: SrcPath::new(dirname, &*filename.to_string_lossy()?),
-                    line: line as u32,
-                    addr: row.address() + obj.addr as u64,
-                    replaced: None,
-                };
+                let addr = row.address() + obj.addr as u64;
+                let loc = Location::new(
+                    SrcPath::new(dirname, &*filename.to_string_lossy()?),
+                    line as u32,
+                );
 
                 if debug {
                     println!(
                         "Location: {}:{} {:x}",
-                        loc.srcpath.to_pathbuf().display(),
-                        loc.line,
-                        loc.addr
+                        loc.srcpath().display(),
+                        loc.line(),
+                        addr
                     );
                 }
 
-                locations.push(loc);
+                locations.push((addr, loc));
             }
         }
     }
