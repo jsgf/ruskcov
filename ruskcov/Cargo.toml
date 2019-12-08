@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 structopt = "0.3"
 gimli = "0.19"
-nix = "0.15"
+nix = "0.16"
 object = "0.16"
 inject-types = { path = "../inject-types" }
 bincode = "1.2"
